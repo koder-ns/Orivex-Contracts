@@ -42,6 +42,17 @@ pub enum SubmissionStatus {
 pub struct Submission {
     pub proof_hash: BytesN<32>,
     pub status: SubmissionStatus,
+    pub reviewed_at: Option<u64>,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Dispute {
+    pub quest_id: u32,
+    pub learner: Address,
+    pub reason: BytesN<32>,
+    pub opened_at: u64,
+    pub resolved: bool,
 }
 
 #[contracttype]
@@ -59,4 +70,7 @@ pub enum DataKey {
     /// 0  = pre-versioning (no Version key present).
     /// 1  = current schema (this build).
     Version,
+    Dispute(u32), // Dispute ID
+    DisputeCounter,
+    Governance,
 }

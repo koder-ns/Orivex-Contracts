@@ -21,13 +21,14 @@ pub const EXPLORE_QUEST_PREFIX: &str = "explore";
 pub const MAX_QUEST_REWARD: i128 = 1_000_000_000_000_000;
 
 pub const PLATFORM_FEE_BASIS_POINTS: u32 = 1500;
+pub const DISPUTE_WINDOW_SECONDS: u64 = 7 * 24 * 60 * 60; // 7 days in seconds
 // Crate overview — Build and Explore quests. Build quests are
 // employer-funded and reviewed per submission. Explore quests are
 // admin-verified and rewarded out of the RewardPool.
 
 pub mod types;
 pub use types::QuestType;
-use types::{DataKey, Quest, Submission, SubmissionStatus};
+use types::{DataKey, Quest, Submission, SubmissionStatus, Dispute};
 
 use soroban_sdk::{
     contract, contractclient, contractevent, contractimpl, token, Address, BytesN, Env, Vec,
@@ -41,6 +42,29 @@ pub trait StakeVaultInterface {
 #[contractclient(name = "RewardPoolClient")]
 pub trait RewardPoolInterface {
     fn distribute_reward(env: Env, caller: Address, learner: Address, amount: i128);
+}
+
+#[contractclient(name = "GovernanceClient")]
+pub trait GovernanceInterface {
+    fn get_proposal(env: Env, proposal_id: u32) -> types::governance::Proposal;
+}
+
+pub mod types {
+    pub mod governance {
+        use soroban_sdk::{contracttype, Address, BytesN};
+
+        #[contracttype]
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        pub struct Proposal {
+            pub id: u32,
+            pub proposer: Address,
+            pub metadata_hash: BytesN<32>,
+            pub votes_for: u32,
+            pub votes_against: u32,
+            pub end_time: u64,
+            pub executed: bool,
+        }
+    }
 }
 
 #[contractevent]
@@ -131,6 +155,37 @@ pub struct RewardPoolUpdated {
 pub struct StakeVaultUpdated {
     #[topic]
     pub admin: Address,
+    #[topic]
+    pub new_address: Address,
+}
+
+#[contractevent]
+pub struct DisputeOpened {
+    #[topic]
+    pub learner: Address,
+    #[topic]
+    pub quest_id: u32,
+    #[topic]
+    pub dispute_id: u32,
+    pub reason: BytesN<32>,
+}
+
+#[contractevent]
+pub struct DisputeResolved {
+    #[topic]
+    pub dispute_id: u32,
+    #[topic]
+    pub learner: Address,
+    #[topic]
+    pub quest_id: u32,
+    pub override_approve: bool,
+}
+
+#[contractevent]
+pub struct GovernanceUpdated {
+    #[topic]
+    pub admin: Address,
+    #[topic]
     pub new_address: Address,
 }
 
@@ -162,6 +217,7 @@ impl QuestEngineContract {
         token: Address,
         reward_pool: Address,
         stake_vault: Address,
+        governance: Option<Address>,
     ) {
         if env.storage().instance().has(&DataKey::Token) {
             panic!("Already initialized");
@@ -175,7 +231,11 @@ impl QuestEngineContract {
         env.storage()
             .instance()
             .set(&DataKey::StakeVault, &stake_vault);
+        if let Some(gov) = governance {
+            env.storage().instance().set(&DataKey::Governance, &gov);
+        }
         env.storage().instance().set(&DataKey::QuestCounter, &0u32);
+        env.storage().instance().set(&DataKey::DisputeCounter, &0u32);
     }
 
     /// Toggles the pause state of the contract (emergency circuit breaker).
@@ -250,6 +310,26 @@ impl QuestEngineContract {
             .set(&DataKey::StakeVault, &new_address);
 
         StakeVaultUpdated { admin, new_address }.publish(&env);
+    }
+
+    /// Updates the Governance contract address used for dispute resolution.
+    /// Admin-only. Emits `GovernanceUpdated` with the new address.
+    pub fn set_governance_address(env: Env, admin: Address, new_address: Address) {
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Not initialized");
+        if admin != stored_admin {
+            panic!("Unauthorized");
+        }
+        admin.require_auth();
+
+        env.storage()
+            .instance()
+            .set(&DataKey::Governance, &new_address);
+
+        GovernanceUpdated { admin, new_address }.publish(&env);
     }
 
     /// Allows an employer to lock USDC directly in the QuestEngine contract.
@@ -424,10 +504,11 @@ impl QuestEngineContract {
             panic!("Submission already exists");
         }
 
-        // 5. Save struct { proof_hash, status: SubmissionStatus::Pending } to storage.
+        // 5. Save struct { proof_hash, status: SubmissionStatus::Pending, reviewed_at: None } to storage.
         let submission = Submission {
             proof_hash: proof_hash.clone(),
             status: SubmissionStatus::Pending,
+            reviewed_at: None,
         };
         env.storage().persistent().set(&submission_key, &submission);
 
@@ -544,7 +625,8 @@ impl QuestEngineContract {
             submission.status = SubmissionStatus::Rejected;
         }
 
-        // 6. Save updated submission to Persistent storage.
+        // 6. Set reviewed_at timestamp and save updated submission to Persistent storage.
+        submission.reviewed_at = Some(env.ledger().timestamp());
         env.storage().persistent().set(&submission_key, &submission);
 
         // 7. Emit SubmissionReviewed event.
@@ -844,6 +926,209 @@ impl QuestEngineContract {
             amount: quest.reward_amount,
         }
         .publish(&env);
+    }
+
+    /// Allows a learner to open a dispute for a rejected submission within the dispute window.
+    /// Learners can only dispute submissions that were rejected, and only within the
+    /// DISPUTE_WINDOW_SECONDS (7 days) from when the submission was reviewed.
+    pub fn dispute_submission(env: Env, learner: Address, quest_id: u32, reason: BytesN<32>) -> u32 {
+        // 1. Require learner authentication
+        learner.require_auth();
+
+        // 2. Retrieve the submission
+        let submission_key = DataKey::Submission(learner.clone(), quest_id);
+        let submission: Submission = env
+            .storage()
+            .persistent()
+            .get(&submission_key)
+            .expect("Submission not found");
+
+        // 3. Verify the submission was rejected
+        if submission.status != SubmissionStatus::Rejected {
+            panic!("Only rejected submissions can be disputed");
+        }
+
+        // 4. Check that the submission was reviewed and we're within the dispute window
+        let reviewed_at = submission.reviewed_at.expect("Submission hasn't been reviewed yet");
+        let current_time = env.ledger().timestamp();
+        if current_time - reviewed_at > DISPUTE_WINDOW_SECONDS {
+            panic!("Dispute window has expired - disputes must be opened within 7 days of review");
+        }
+
+        // We'll track the opened_at timestamp for the dispute
+        // Increment dispute counter
+        let mut dispute_id: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::DisputeCounter)
+            .unwrap_or(0);
+        dispute_id += 1;
+        env.storage()
+            .instance()
+            .set(&DataKey::DisputeCounter, &dispute_id);
+
+        // Create and store the dispute
+        let dispute = Dispute {
+            quest_id,
+            learner: learner.clone(),
+            reason: reason.clone(),
+            opened_at: current_time,
+            resolved: false,
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Dispute(dispute_id), &dispute);
+
+        // Emit DisputeOpened event
+        DisputeOpened {
+            learner,
+            quest_id,
+            dispute_id,
+            reason,
+        }
+        .publish(&env);
+
+        dispute_id
+    }
+
+    /// Admin-only function to resolve a dispute. Can override the original rejection to approve it.
+    /// Emits a DisputeResolved event when completed.
+    pub fn resolve_dispute(env: Env, admin: Address, dispute_id: u32, override_approve: bool) {
+        // 1. Verify admin
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Not initialized");
+        if admin != stored_admin {
+            panic!("Unauthorized");
+        }
+        admin.require_auth();
+
+        // 2. Retrieve the dispute
+        let mut dispute: Dispute = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Dispute(dispute_id))
+            .expect("Dispute not found");
+
+        // 3. Verify dispute is not already resolved
+        if dispute.resolved {
+            panic!("Dispute has already been resolved");
+        }
+
+        // 4. Mark dispute as resolved
+        dispute.resolved = true;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Dispute(dispute_id), &dispute);
+
+        // 5. If we need to override and approve, process the payout
+        if override_approve {
+            let quest: Quest = env
+                .storage()
+                .persistent()
+                .get(&DataKey::Quest(dispute.quest_id))
+                .expect("Quest not found");
+
+            // Update submission status to Approved
+            let submission_key = DataKey::Submission(dispute.learner.clone(), dispute.quest_id);
+            let mut submission: Submission = env
+                .storage()
+                .persistent()
+                .get(&submission_key)
+                .expect("Submission not found");
+            submission.status = SubmissionStatus::Approved;
+            env.storage().persistent().set(&submission_key, &submission);
+
+            // Process payout just like in review_submission
+            let token_address: Address = env
+                .storage()
+                .instance()
+                .get(&DataKey::Token)
+                .expect("Not initialized");
+            let token_client = token::Client::new(&env, &token_address);
+
+            // Fetch stake vault and get multiplier
+            let stake_vault_address: Address = env
+                .storage()
+                .instance()
+                .get(&DataKey::StakeVault)
+                .expect("Not initialized");
+            let stake_vault_client = StakeVaultClient::new(&env, &stake_vault_address);
+            let multiplier = stake_vault_client.get_multiplier(&dispute.learner);
+
+            let (fee, learner_amount, boost_actual, boost_capped) =
+                compute_learner_payout(quest.reward_amount, multiplier);
+
+            let reward_pool: Address = env
+                .storage()
+                .instance()
+                .get(&DataKey::RewardPool)
+                .expect("Not initialized");
+
+            token_client.transfer(&env.current_contract_address(), &reward_pool, &fee);
+            token_client.transfer(&env.current_contract_address(), &dispute.learner, &learner_amount);
+
+            if boost_capped {
+                PayoutComputed {
+                    learner: dispute.learner.clone(),
+                    quest_id: dispute.quest_id,
+                    fee,
+                    learner_amount,
+                    boost_actual,
+                    boost_capped,
+                }
+                .publish(&env);
+            }
+        }
+
+        // 6. Emit DisputeResolved event
+        DisputeResolved {
+            dispute_id,
+            learner: dispute.learner,
+            quest_id: dispute.quest_id,
+            override_approve,
+        }
+        .publish(&env);
+    }
+
+    /// Governance-only function to resolve a dispute based on voting results.
+    /// Resolves the dispute if votes_for > votes_against, otherwise leaves it as rejected.
+    pub fn resolve_dispute_via_governance(env: Env, dispute_id: u32, proposal_id: u32) {
+        // 1. Get governance address
+        let governance_address: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Governance)
+            .expect("Governance contract not configured");
+
+        // 2. Create governance client and get the proposal
+        let governance_client = GovernanceClient::new(&env, &governance_address);
+        let proposal = governance_client.get_proposal(proposal_id);
+
+        // 3. Verify proposal is executed and votes are in favor
+        if !proposal.executed {
+            panic!("Proposal has not been executed");
+        }
+
+        if proposal.votes_for <= proposal.votes_against {
+            panic!("Insufficient votes to approve the dispute");
+        }
+
+        // 4. If proposal passes, resolve the dispute with override_approve = true
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Not initialized");
+        Self::resolve_dispute(env, stored_admin, dispute_id, true);
+    }
+
+    /// Returns a dispute by its ID.
+    pub fn get_dispute(env: Env, dispute_id: u32) -> Option<Dispute> {
+        env.storage().persistent().get(&DataKey::Dispute(dispute_id))
     }
 }
 
