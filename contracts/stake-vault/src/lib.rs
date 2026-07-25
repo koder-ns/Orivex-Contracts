@@ -144,7 +144,7 @@ impl StakeVault {
             .get(&DataKey::UserStake(user.clone()))
             .expect("No stake found");
 
-        let lock_period: u64 = 604800;
+        let lock_period: u64 = DEFAULT_LOCK_PERIOD_SECONDS;
         if env.ledger().timestamp() < stake_info.lock_timestamp + lock_period {
             panic!("Lock period active");
         }
@@ -187,12 +187,12 @@ impl StakeVault {
                 lock_timestamp: 0,
             });
 
-        if stake_info.amount >= 500 {
-            200
-        } else if stake_info.amount >= 100 {
-            120
+        if stake_info.amount >= TIER_HIGH_STAKE_BOUND {
+            STAKE_TIER_HIGH_BPS
+        } else if stake_info.amount >= TIER_LOW_STAKE_BOUND {
+            STAKE_TIER_LOW_BPS
         } else {
-            100
+            STAKE_TIER_NONE_BPS
         }
     }
 

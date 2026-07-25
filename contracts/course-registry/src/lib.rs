@@ -188,7 +188,9 @@ impl CourseRegistry {
             .instance()
             .get(&DataKey::CourseCount)
             .unwrap_or(0);
-        let new_id = current_count + 1;
+        assert!(total_modules <= DEFAULT_TOTAL_MODULES_BOUND, "total_modules exceeds bound");
+        assert!(current_count < MAX_COURSE_ID, "Course ID limit reached");
+        let new_id = current_count + INITIAL_COURSE_ID;
         env.storage().instance().set(&DataKey::CourseCount, &new_id);
 
         let course = Course {
@@ -531,7 +533,7 @@ impl CourseRegistry {
         };
 
         let reward_pool = RewardPoolClient::new(env, &reward_pool_address);
-        let base_reward: i128 = 10_0000000; // 10 USDC (7 decimal places)
+        let base_reward: i128 = BASE_REWARD_AMOUNT;
 
         match reward_pool.try_distribute_reward(
             &env.current_contract_address(),

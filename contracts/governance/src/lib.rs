@@ -9,7 +9,6 @@
 ///   1 – initial versioned schema; Proposal struct unchanged from v0
 pub const VERSION: u32 = 1;
 
-pub const PROPOSAL_COUNTER_START: u32 = 0;
 // Operational notes — proposals progress through: created →
 // voting → (executed | cancelled). Cancellation locks the
 // proposal via `executed = true`. Vote weight is fetched at
@@ -17,8 +16,6 @@ pub const PROPOSAL_COUNTER_START: u32 = 0;
 // determine the weight.
 
 pub const QUORUM_BASIS_POINTS: u32 = 3300;
-
-pub const DEFAULT_VOTING_PERIOD_SECONDS: u64 = 604800;
 // Crate overview — badge-weighted proposal lifecycle: create,
 // vote, execute, cancel. Vote weight = number of badges owned at
 // the moment of the cast.
@@ -252,6 +249,12 @@ impl Governance {
     pub fn execute_proposal(env: Env, proposal_id: u32) {
         let mut proposal = Self::get_proposal(env.clone(), proposal_id);
 
+        let total_votes = proposal.votes_for + proposal.votes_against;
+        let quorum_threshold = (total_votes as u64 * QUORUM_BASIS_POINTS as u64) / 10_000;
+        assert!(
+            total_votes as u64 >= quorum_threshold,
+            "Quorum not met"
+        );
         assert!(
             env.ledger().timestamp() > proposal.end_time,
             "Voting still active"

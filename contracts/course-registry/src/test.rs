@@ -99,6 +99,22 @@ fn test_zero_modules_panics() {
 }
 
 #[test]
+#[should_panic(expected = "total_modules exceeds bound")]
+fn test_total_modules_above_bound_panics() {
+    let (env, client) = setup();
+    let admin = Address::generate(&env);
+    let instructor = Address::generate(&env);
+
+    client.initialize(&admin);
+    client.create_course(
+        &admin,
+        &instructor,
+        &(crate::DEFAULT_TOTAL_MODULES_BOUND + 1),
+        &dummy_hash(&env),
+    );
+}
+
+#[test]
 #[should_panic(expected = "Unauthorized: Caller is not the protocol admin")]
 fn test_unauthorized_admin_panics() {
     let (env, client) = setup();
