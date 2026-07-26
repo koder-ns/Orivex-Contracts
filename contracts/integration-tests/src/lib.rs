@@ -81,11 +81,13 @@ fn setup_full_platform() -> (
     stake_vault_client.initialize(&admin, &token_address);
 
     // QuestEngine: admin, token, reward_pool, stake_vault
+    let governance_address = governance_client.address.clone();
     quest_engine_client.initialize(
         &admin,
         &token_address,
         &reward_pool_client.address,
         &stake_vault_client.address,
+        &Some(governance_address),
     );
 
     // Governance: admin, badge_contract_address

@@ -260,6 +260,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2459377285ad874054d797f3ccebf984978aa39129f6eafde5cdc8315b612f8"
 
 [[package]]
+name = "contracts-common"
+version = "0.1.0"
+dependencies = [
+ "soroban-sdk",
+]
+
+[[package]]
 name = "core-foundation-sys"
 version = "0.8.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -270,6 +277,7 @@ name = "course-registry"
 version = "0.1.0"
 dependencies = [
  "badge-nft",
+ "contracts-common",
  "reward-pool",
  "soroban-sdk",
 ]
@@ -795,6 +803,19 @@ name = "indexmap-nostd"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8e04e2fd2b8188ea827b32ef11de88377086d690286ab35747ef7f9bf3ccb590"
+
+[[package]]
+name = "integration-tests"
+version = "0.1.0"
+dependencies = [
+ "badge-nft",
+ "course-registry",
+ "governance",
+ "quest-engine",
+ "reward-pool",
+ "soroban-sdk",
+ "stake-vault",
+]
 
 [[package]]
 name = "itertools"

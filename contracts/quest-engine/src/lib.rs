@@ -49,24 +49,6 @@ pub trait GovernanceInterface {
     fn get_proposal(env: Env, proposal_id: u32) -> types::governance::Proposal;
 }
 
-pub mod types {
-    pub mod governance {
-        use soroban_sdk::{contracttype, Address, BytesN};
-
-        #[contracttype]
-        #[derive(Clone, Debug, Eq, PartialEq)]
-        pub struct Proposal {
-            pub id: u32,
-            pub proposer: Address,
-            pub metadata_hash: BytesN<32>,
-            pub votes_for: u32,
-            pub votes_against: u32,
-            pub end_time: u64,
-            pub executed: bool,
-        }
-    }
-}
-
 #[contractevent]
 pub struct QuestCreated {
     #[topic]
@@ -1119,7 +1101,7 @@ impl QuestEngineContract {
 
         // 2. Create governance client and get the proposal
         let governance_client = GovernanceClient::new(&env, &governance_address);
-        let proposal = governance_client.get_proposal(proposal_id);
+        let proposal = governance_client.get_proposal(&proposal_id);
 
         // 3. Verify proposal is executed and votes are in favor
         if !proposal.executed {
