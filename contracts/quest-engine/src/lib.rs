@@ -264,7 +264,10 @@ impl QuestEngineContract {
         // 1. employer.require_auth()
         employer.require_auth();
 
-        assert!(reward_amount <= MAX_QUEST_REWARD, "reward_amount exceeds max");
+        assert!(
+            reward_amount <= MAX_QUEST_REWARD,
+            "reward_amount exceeds max"
+        );
 
         // 2. Fetch token_client for the USDC asset.
         let token_address: Address = env

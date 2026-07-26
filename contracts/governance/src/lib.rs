@@ -251,10 +251,7 @@ impl Governance {
 
         let total_votes = proposal.votes_for + proposal.votes_against;
         let quorum_threshold = (total_votes as u64 * QUORUM_BASIS_POINTS as u64) / 10_000;
-        assert!(
-            total_votes as u64 >= quorum_threshold,
-            "Quorum not met"
-        );
+        assert!(total_votes as u64 >= quorum_threshold, "Quorum not met");
         assert!(
             env.ledger().timestamp() > proposal.end_time,
             "Voting still active"

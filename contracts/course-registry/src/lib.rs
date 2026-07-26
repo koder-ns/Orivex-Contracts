@@ -188,7 +188,10 @@ impl CourseRegistry {
             .instance()
             .get(&DataKey::CourseCount)
             .unwrap_or(0);
-        assert!(total_modules <= DEFAULT_TOTAL_MODULES_BOUND, "total_modules exceeds bound");
+        assert!(
+            total_modules <= DEFAULT_TOTAL_MODULES_BOUND,
+            "total_modules exceeds bound"
+        );
         assert!(current_count < MAX_COURSE_ID, "Course ID limit reached");
         let new_id = current_count + INITIAL_COURSE_ID;
         env.storage().instance().set(&DataKey::CourseCount, &new_id);
