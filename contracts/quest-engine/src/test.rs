@@ -50,7 +50,13 @@ fn setup() -> (
     let admin = Address::generate(&env);
     let reward_pool = Address::generate(&env);
     let governance: Option<Address> = None;
-    client.initialize(&admin, &token_id, &reward_pool, &stake_vault_id, &governance);
+    client.initialize(
+        &admin,
+        &token_id,
+        &reward_pool,
+        &stake_vault_id,
+        &governance,
+    );
 
     (env, client, token_id, reward_pool, admin, stake_vault_id)
 }
@@ -71,7 +77,13 @@ fn token_balance(env: &Env, token_id: &Address, of: &Address) -> i128 {
 fn test_initialize_twice_panics() {
     let (_env, client, token_id, reward_pool, admin, stake_vault_id) = setup();
     let governance: Option<Address> = None;
-    client.initialize(&admin, &token_id, &reward_pool, &stake_vault_id, &governance);
+    client.initialize(
+        &admin,
+        &token_id,
+        &reward_pool,
+        &stake_vault_id,
+        &governance,
+    );
 }
 
 // ── set_reward_pool_address Tests ───────────────────────────────────────────
@@ -630,7 +642,13 @@ fn setup_with_multiplier(
     let admin = Address::generate(&env);
     let reward_pool = Address::generate(&env);
     let governance: Option<Address> = None;
-    client.initialize(&admin, &token_id, &reward_pool, &stake_vault_id, &governance);
+    client.initialize(
+        &admin,
+        &token_id,
+        &reward_pool,
+        &stake_vault_id,
+        &governance,
+    );
 
     (env, client, token_id, reward_pool)
 }
@@ -1121,7 +1139,13 @@ fn setup_vault_with_multiplier(
     let admin = Address::generate(&env);
     let reward_pool = Address::generate(&env);
     let governance: Option<Address> = None;
-    client.initialize(&admin, &token_id, &reward_pool, &stake_vault_id, &governance);
+    client.initialize(
+        &admin,
+        &token_id,
+        &reward_pool,
+        &stake_vault_id,
+        &governance,
+    );
 
     (env, client, token_id, reward_pool)
 }

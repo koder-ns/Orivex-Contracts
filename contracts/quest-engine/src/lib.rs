@@ -22,13 +22,13 @@ pub const MAX_QUEST_REWARD: i128 = 1_000_000_000_000_000;
 
 pub const PLATFORM_FEE_BASIS_POINTS: u32 = 1500;
 pub const DISPUTE_WINDOW_SECONDS: u64 = 7 * 24 * 60 * 60; // 7 days in seconds
-// Crate overview — Build and Explore quests. Build quests are
-// employer-funded and reviewed per submission. Explore quests are
-// admin-verified and rewarded out of the RewardPool.
+                                                          // Crate overview — Build and Explore quests. Build quests are
+                                                          // employer-funded and reviewed per submission. Explore quests are
+                                                          // admin-verified and rewarded out of the RewardPool.
 
 pub mod types;
 pub use types::QuestType;
-use types::{DataKey, Quest, Submission, SubmissionStatus, Dispute};
+use types::{DataKey, Dispute, Quest, Submission, SubmissionStatus};
 
 use soroban_sdk::{
     contract, contractclient, contractevent, contractimpl, token, Address, BytesN, Env, Vec,
@@ -235,7 +235,9 @@ impl QuestEngineContract {
             env.storage().instance().set(&DataKey::Governance, &gov);
         }
         env.storage().instance().set(&DataKey::QuestCounter, &0u32);
-        env.storage().instance().set(&DataKey::DisputeCounter, &0u32);
+        env.storage()
+            .instance()
+            .set(&DataKey::DisputeCounter, &0u32);
     }
 
     /// Toggles the pause state of the contract (emergency circuit breaker).
@@ -931,7 +933,12 @@ impl QuestEngineContract {
     /// Allows a learner to open a dispute for a rejected submission within the dispute window.
     /// Learners can only dispute submissions that were rejected, and only within the
     /// DISPUTE_WINDOW_SECONDS (7 days) from when the submission was reviewed.
-    pub fn dispute_submission(env: Env, learner: Address, quest_id: u32, reason: BytesN<32>) -> u32 {
+    pub fn dispute_submission(
+        env: Env,
+        learner: Address,
+        quest_id: u32,
+        reason: BytesN<32>,
+    ) -> u32 {
         // 1. Require learner authentication
         learner.require_auth();
 
@@ -949,7 +956,9 @@ impl QuestEngineContract {
         }
 
         // 4. Check that the submission was reviewed and we're within the dispute window
-        let reviewed_at = submission.reviewed_at.expect("Submission hasn't been reviewed yet");
+        let reviewed_at = submission
+            .reviewed_at
+            .expect("Submission hasn't been reviewed yet");
         let current_time = env.ledger().timestamp();
         if current_time - reviewed_at > DISPUTE_WINDOW_SECONDS {
             panic!("Dispute window has expired - disputes must be opened within 7 days of review");
@@ -1069,7 +1078,11 @@ impl QuestEngineContract {
                 .expect("Not initialized");
 
             token_client.transfer(&env.current_contract_address(), &reward_pool, &fee);
-            token_client.transfer(&env.current_contract_address(), &dispute.learner, &learner_amount);
+            token_client.transfer(
+                &env.current_contract_address(),
+                &dispute.learner,
+                &learner_amount,
+            );
 
             if boost_capped {
                 PayoutComputed {
@@ -1128,7 +1141,9 @@ impl QuestEngineContract {
 
     /// Returns a dispute by its ID.
     pub fn get_dispute(env: Env, dispute_id: u32) -> Option<Dispute> {
-        env.storage().persistent().get(&DataKey::Dispute(dispute_id))
+        env.storage()
+            .persistent()
+            .get(&DataKey::Dispute(dispute_id))
     }
 }
 
