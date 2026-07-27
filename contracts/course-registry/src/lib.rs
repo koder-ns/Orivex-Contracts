@@ -340,7 +340,7 @@ impl CourseRegistry {
     }
 
     /// Returns the full details of a specific course.
-    ///
+    ////
     /// # Arguments
     /// * `env` - The Soroban environment
     /// * `id` - The course ID
