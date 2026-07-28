@@ -104,7 +104,7 @@ mod contract_impl {
     use crate::types::DataKey;
     use crate::{
         ContractUpgraded, EmergencySweep, PoolFunded, PoolInitialized, RewardDistributed,
-        SpenderAdded, MAX_SPENDERS, MIN_PAYOUT_AMOUNT, PLATFORM_FEE_BASIS_POINTS,
+        SpenderAdded, SpenderRemoved, MAX_SPENDERS, MIN_PAYOUT_AMOUNT, PLATFORM_FEE_BASIS_POINTS,
         REWARD_TOKEN_DECIMALS,
     };
 
