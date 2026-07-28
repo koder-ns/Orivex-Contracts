@@ -251,7 +251,9 @@ fn test_explore_quest_payout_drains_reward_pool_correctly() {
     // 1. Admin creates an Explore quest (explore quests are admin-only)
     let quest_id = quest_engine.create_explore_quest(&admin, &quest_reward, &dummy_hash(&env));
 
-    // 2. Admin verifies the explore quest directly (Explore quests do not use submit_proof)
+    // 2. Learner submits their off-chain proof, then admin verifies
+    let proof_hash = BytesN::from_array(&env, &[0xddu8; 32]);
+    quest_engine.submit_explore_proof(&learner, &quest_id, &proof_hash);
     quest_engine.verify_explore_quest(&admin, &learner, &quest_id);
 
     // 3. Verify learner received the reward

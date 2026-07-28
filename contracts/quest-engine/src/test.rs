@@ -938,6 +938,7 @@ fn test_verify_explore_quest_success() {
     let learner = Address::generate(&env);
     let reward_amount: i128 = 500;
     let metadata_hash = BytesN::from_array(&env, &[63u8; 32]);
+    let proof_hash = BytesN::from_array(&env, &[0xaau8; 32]);
 
     // Register mock reward pool and stake vault
     let mock_reward_pool_id = env.register(MockRewardPool, ());
@@ -953,15 +954,16 @@ fn test_verify_explore_quest_success() {
         &mock_stake_vault_id,
     );
 
-    // Create explore quest
+    // Create explore quest and submit proof first
     let quest_id = client.create_explore_quest(&admin, &reward_amount, &metadata_hash);
+    client.submit_explore_proof(&learner, &quest_id, &proof_hash);
 
     // Verify the quest
     client.verify_explore_quest(&admin, &learner, &quest_id);
 
-    // Just verify it doesn't panic - the mock reward pool doesn't actually transfer tokens
-    let quest = client.get_quest(&quest_id).unwrap();
-    assert_eq!(quest.quest_type, QuestType::Explore);
+    // Submission status should now be Verified
+    let sub = client.get_explore_submission(&learner, &quest_id).unwrap();
+    assert_eq!(sub.status, crate::types::ExploreSubmissionStatus::Verified);
 }
 
 #[test]
@@ -975,6 +977,7 @@ fn test_verify_explore_quest_unauthorized() {
 
     let quest_id = client.create_explore_quest(&admin, &reward_amount, &metadata_hash);
 
+    // Panics at admin check before reaching submission guard
     client.verify_explore_quest(&unauthorized, &learner, &quest_id);
 }
 
@@ -1201,4 +1204,345 @@ fn test_review_submission_multiplier_120_large_reward() {
     let base_amount = 85_000;
     assert_eq!(token_balance(&env, &token_id, &learner), base_amount);
     assert_eq!(token_balance(&env, &token_id, &reward_pool), fee);
+}
+
+// ── submit_explore_proof Tests ───────────────────────────────────────────────
+
+/// Helper: set up a QuestEngine wired to a MockRewardPool so that
+/// `verify_explore_quest` can be called without hitting a real RewardPool.
+fn setup_with_mock_reward_pool() -> (
+    Env,
+    QuestEngineContractClient<'static>,
+    Address, // token_id
+    Address, // admin
+) {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(QuestEngineContract, ());
+    let client = QuestEngineContractClient::new(&env, &contract_id);
+
+    let token_admin = Address::generate(&env);
+    let token_id = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+
+    let mock_reward_pool_id = env.register(MockRewardPool, ());
+    let mock_stake_vault_id = env.register(MockStakeVault, ());
+    let admin = Address::generate(&env);
+
+    client.initialize(
+        &admin,
+        &token_id,
+        &mock_reward_pool_id,
+        &mock_stake_vault_id,
+    );
+    (env, client, token_id, admin)
+}
+
+#[test]
+fn test_submit_explore_proof_success() {
+    let (env, client, _token_id, admin) = setup_with_mock_reward_pool();
+    let learner = Address::generate(&env);
+    let metadata_hash = BytesN::from_array(&env, &[0x80u8; 32]);
+    let proof_hash = BytesN::from_array(&env, &[0x81u8; 32]);
+
+    let quest_id = client.create_explore_quest(&admin, &500, &metadata_hash);
+    client.submit_explore_proof(&learner, &quest_id, &proof_hash);
+
+    let sub = client.get_explore_submission(&learner, &quest_id).unwrap();
+    assert_eq!(sub.proof_hash, proof_hash);
+    assert_eq!(sub.status, crate::types::ExploreSubmissionStatus::Pending);
+}
+
+#[test]
+fn test_submit_explore_proof_emits_event() {
+    let (env, client, _token_id, admin) = setup_with_mock_reward_pool();
+    let learner = Address::generate(&env);
+    let metadata_hash = BytesN::from_array(&env, &[0x82u8; 32]);
+    let proof_hash = BytesN::from_array(&env, &[0x83u8; 32]);
+
+    let quest_id = client.create_explore_quest(&admin, &500, &metadata_hash);
+    client.submit_explore_proof(&learner, &quest_id, &proof_hash);
+
+    // ExploreProofSubmitted event must be present
+    assert!(!env.events().all().is_empty());
+}
+
+#[test]
+#[should_panic(expected = "Quest not found")]
+fn test_submit_explore_proof_nonexistent_quest_panics() {
+    let (env, client, _token_id, _admin) = setup_with_mock_reward_pool();
+    let learner = Address::generate(&env);
+    let proof_hash = BytesN::from_array(&env, &[0x84u8; 32]);
+
+    client.submit_explore_proof(&learner, &999, &proof_hash);
+}
+
+#[test]
+#[should_panic(expected = "Only Explore quests accept explore proofs")]
+fn test_submit_explore_proof_on_build_quest_panics() {
+    let (env, client, token_id, _admin) = setup_with_mock_reward_pool();
+    let employer = Address::generate(&env);
+    let learner = Address::generate(&env);
+    let metadata_hash = BytesN::from_array(&env, &[0x85u8; 32]);
+    let proof_hash = BytesN::from_array(&env, &[0x86u8; 32]);
+
+    // Fund and create a Build quest
+    let sac = soroban_sdk::token::StellarAssetClient::new(&env, &token_id);
+    sac.mint(&employer, &1_000);
+    let quest_id = client.create_build_quest(&employer, &1_000, &metadata_hash);
+
+    // Attempting to submit an explore proof against a Build quest should fail
+    client.submit_explore_proof(&learner, &quest_id, &proof_hash);
+}
+
+#[test]
+#[should_panic(expected = "Explore submission already exists")]
+fn test_submit_explore_proof_duplicate_panics() {
+    let (env, client, _token_id, admin) = setup_with_mock_reward_pool();
+    let learner = Address::generate(&env);
+    let metadata_hash = BytesN::from_array(&env, &[0x87u8; 32]);
+    let proof_hash = BytesN::from_array(&env, &[0x88u8; 32]);
+
+    let quest_id = client.create_explore_quest(&admin, &500, &metadata_hash);
+    client.submit_explore_proof(&learner, &quest_id, &proof_hash);
+    // Second submission must panic
+    client.submit_explore_proof(&learner, &quest_id, &proof_hash);
+}
+
+#[test]
+fn test_get_explore_submission_returns_none_when_absent() {
+    let (env, client, _token_id, _admin) = setup_with_mock_reward_pool();
+    let learner = Address::generate(&env);
+    assert_eq!(client.get_explore_submission(&learner, &999), None);
+}
+
+// ── verify_explore_quest (with submission guard) Tests ───────────────────────
+
+#[test]
+#[should_panic(expected = "No proof submission found for this learner")]
+fn test_verify_explore_quest_without_submission_panics() {
+    let (env, client, _token_id, admin) = setup_with_mock_reward_pool();
+    let learner = Address::generate(&env);
+    let metadata_hash = BytesN::from_array(&env, &[0x90u8; 32]);
+
+    let quest_id = client.create_explore_quest(&admin, &500, &metadata_hash);
+    // No submit_explore_proof call — must panic
+    client.verify_explore_quest(&admin, &learner, &quest_id);
+}
+
+#[test]
+#[should_panic(expected = "Submission is not pending")]
+fn test_verify_explore_quest_already_verified_panics() {
+    let (env, client, _token_id, admin) = setup_with_mock_reward_pool();
+    let learner = Address::generate(&env);
+    let metadata_hash = BytesN::from_array(&env, &[0x91u8; 32]);
+    let proof_hash = BytesN::from_array(&env, &[0x92u8; 32]);
+
+    let quest_id = client.create_explore_quest(&admin, &500, &metadata_hash);
+    client.submit_explore_proof(&learner, &quest_id, &proof_hash);
+    client.verify_explore_quest(&admin, &learner, &quest_id);
+    // Second verify must panic — submission is now Verified, not Pending
+    client.verify_explore_quest(&admin, &learner, &quest_id);
+}
+
+#[test]
+fn test_verify_explore_quest_full_lifecycle() {
+    let (env, client, _token_id, admin) = setup_with_mock_reward_pool();
+    let learner = Address::generate(&env);
+    let metadata_hash = BytesN::from_array(&env, &[0x93u8; 32]);
+    let proof_hash = BytesN::from_array(&env, &[0x94u8; 32]);
+
+    let quest_id = client.create_explore_quest(&admin, &500, &metadata_hash);
+
+    // Step 1: learner submits proof — ExploreProofSubmitted event emitted
+    client.submit_explore_proof(&learner, &quest_id, &proof_hash);
+    assert!(
+        !env.events().all().is_empty(),
+        "ExploreProofSubmitted not emitted"
+    );
+
+    // Step 2: admin verifies — ExploreQuestVerified event emitted
+    client.verify_explore_quest(&admin, &learner, &quest_id);
+    assert!(
+        !env.events().all().is_empty(),
+        "ExploreQuestVerified not emitted"
+    );
+
+    // Submission status is now Verified
+    let sub = client.get_explore_submission(&learner, &quest_id).unwrap();
+    assert_eq!(sub.status, crate::types::ExploreSubmissionStatus::Verified);
+}
+
+// ── reject_explore_quest Tests ───────────────────────────────────────────────
+
+#[test]
+fn test_reject_explore_quest_success() {
+    let (env, client, _token_id, admin) = setup_with_mock_reward_pool();
+    let learner = Address::generate(&env);
+    let metadata_hash = BytesN::from_array(&env, &[0xa0u8; 32]);
+    let proof_hash = BytesN::from_array(&env, &[0xa1u8; 32]);
+    let reason = soroban_sdk::String::from_str(&env, "Proof does not match task requirements");
+
+    let quest_id = client.create_explore_quest(&admin, &500, &metadata_hash);
+    client.submit_explore_proof(&learner, &quest_id, &proof_hash);
+
+    client.reject_explore_quest(&admin, &learner, &quest_id, &reason);
+
+    let sub = client.get_explore_submission(&learner, &quest_id).unwrap();
+    assert_eq!(sub.status, crate::types::ExploreSubmissionStatus::Rejected);
+}
+
+#[test]
+fn test_reject_explore_quest_emits_event() {
+    let (env, client, _token_id, admin) = setup_with_mock_reward_pool();
+    let learner = Address::generate(&env);
+    let metadata_hash = BytesN::from_array(&env, &[0xa2u8; 32]);
+    let proof_hash = BytesN::from_array(&env, &[0xa3u8; 32]);
+    let reason = soroban_sdk::String::from_str(&env, "Insufficient evidence");
+
+    let quest_id = client.create_explore_quest(&admin, &500, &metadata_hash);
+    client.submit_explore_proof(&learner, &quest_id, &proof_hash);
+    client.reject_explore_quest(&admin, &learner, &quest_id, &reason);
+
+    // ExploreSubmissionRejected event must be present
+    assert!(!env.events().all().is_empty());
+}
+
+#[test]
+#[should_panic(expected = "Unauthorized")]
+fn test_reject_explore_quest_wrong_admin_panics() {
+    let (env, client, _token_id, admin) = setup_with_mock_reward_pool();
+    let learner = Address::generate(&env);
+    let attacker = Address::generate(&env);
+    let metadata_hash = BytesN::from_array(&env, &[0xa4u8; 32]);
+    let proof_hash = BytesN::from_array(&env, &[0xa5u8; 32]);
+    let reason = soroban_sdk::String::from_str(&env, "n/a");
+
+    let quest_id = client.create_explore_quest(&admin, &500, &metadata_hash);
+    client.submit_explore_proof(&learner, &quest_id, &proof_hash);
+
+    client.reject_explore_quest(&attacker, &learner, &quest_id, &reason);
+}
+
+#[test]
+#[should_panic(expected = "No proof submission found for this learner")]
+fn test_reject_explore_quest_without_submission_panics() {
+    let (env, client, _token_id, admin) = setup_with_mock_reward_pool();
+    let learner = Address::generate(&env);
+    let metadata_hash = BytesN::from_array(&env, &[0xa6u8; 32]);
+    let reason = soroban_sdk::String::from_str(&env, "n/a");
+
+    let quest_id = client.create_explore_quest(&admin, &500, &metadata_hash);
+    // No submit_explore_proof call
+    client.reject_explore_quest(&admin, &learner, &quest_id, &reason);
+}
+
+#[test]
+#[should_panic(expected = "Submission is not pending")]
+fn test_reject_explore_quest_already_rejected_panics() {
+    let (env, client, _token_id, admin) = setup_with_mock_reward_pool();
+    let learner = Address::generate(&env);
+    let metadata_hash = BytesN::from_array(&env, &[0xa7u8; 32]);
+    let proof_hash = BytesN::from_array(&env, &[0xa8u8; 32]);
+    let reason = soroban_sdk::String::from_str(&env, "Duplicate submission");
+
+    let quest_id = client.create_explore_quest(&admin, &500, &metadata_hash);
+    client.submit_explore_proof(&learner, &quest_id, &proof_hash);
+
+    client.reject_explore_quest(&admin, &learner, &quest_id, &reason);
+    // Second rejection must panic — no longer Pending
+    client.reject_explore_quest(&admin, &learner, &quest_id, &reason);
+}
+
+#[test]
+#[should_panic(expected = "Submission is not pending")]
+fn test_reject_after_verify_panics() {
+    let (env, client, _token_id, admin) = setup_with_mock_reward_pool();
+    let learner = Address::generate(&env);
+    let metadata_hash = BytesN::from_array(&env, &[0xa9u8; 32]);
+    let proof_hash = BytesN::from_array(&env, &[0xaau8; 32]);
+    let reason = soroban_sdk::String::from_str(&env, "Too late");
+
+    let quest_id = client.create_explore_quest(&admin, &500, &metadata_hash);
+    client.submit_explore_proof(&learner, &quest_id, &proof_hash);
+    client.verify_explore_quest(&admin, &learner, &quest_id);
+
+    // Submission is now Verified — rejection must panic
+    client.reject_explore_quest(&admin, &learner, &quest_id, &reason);
+}
+
+#[test]
+#[should_panic(expected = "Reason exceeds maximum length")]
+fn test_reject_explore_quest_reason_too_long_panics() {
+    let (env, client, _token_id, admin) = setup_with_mock_reward_pool();
+    let learner = Address::generate(&env);
+    let metadata_hash = BytesN::from_array(&env, &[0xabu8; 32]);
+    let proof_hash = BytesN::from_array(&env, &[0xacu8; 32]);
+
+    // Build a 257-byte string (one over the 256-byte limit)
+    let long: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\
+                       aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\
+                       aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\
+                       aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\
+                       a"; // 257 chars
+    let reason = soroban_sdk::String::from_str(&env, long);
+
+    let quest_id = client.create_explore_quest(&admin, &500, &metadata_hash);
+    client.submit_explore_proof(&learner, &quest_id, &proof_hash);
+
+    client.reject_explore_quest(&admin, &learner, &quest_id, &reason);
+}
+
+#[test]
+fn test_reject_explore_quest_reason_at_max_length_succeeds() {
+    let (env, client, _token_id, admin) = setup_with_mock_reward_pool();
+    let learner = Address::generate(&env);
+    let metadata_hash = BytesN::from_array(&env, &[0xadu8; 32]);
+    let proof_hash = BytesN::from_array(&env, &[0xaeu8; 32]);
+
+    // Exactly 256 bytes — must not panic
+    let exactly_256: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\
+                              aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\
+                              aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\
+                              aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"; // 256 chars
+    let reason = soroban_sdk::String::from_str(&env, exactly_256);
+
+    let quest_id = client.create_explore_quest(&admin, &500, &metadata_hash);
+    client.submit_explore_proof(&learner, &quest_id, &proof_hash);
+
+    client.reject_explore_quest(&admin, &learner, &quest_id, &reason);
+
+    let sub = client.get_explore_submission(&learner, &quest_id).unwrap();
+    assert_eq!(sub.status, crate::types::ExploreSubmissionStatus::Rejected);
+}
+
+#[test]
+fn test_full_explore_lifecycle_rejection_path() {
+    let (env, client, _token_id, admin) = setup_with_mock_reward_pool();
+    let learner = Address::generate(&env);
+    let metadata_hash = BytesN::from_array(&env, &[0xb0u8; 32]);
+    let proof_hash = BytesN::from_array(&env, &[0xb1u8; 32]);
+    let reason = soroban_sdk::String::from_str(&env, "Off-chain proof URL returned 404");
+
+    let quest_id = client.create_explore_quest(&admin, &1_000, &metadata_hash);
+
+    // Learner logs intent — ExploreProofSubmitted event
+    client.submit_explore_proof(&learner, &quest_id, &proof_hash);
+    assert!(
+        !env.events().all().is_empty(),
+        "ExploreProofSubmitted not emitted"
+    );
+    let sub = client.get_explore_submission(&learner, &quest_id).unwrap();
+    assert_eq!(sub.status, crate::types::ExploreSubmissionStatus::Pending);
+
+    // Admin rejects — ExploreSubmissionRejected event
+    client.reject_explore_quest(&admin, &learner, &quest_id, &reason);
+    assert!(
+        !env.events().all().is_empty(),
+        "ExploreSubmissionRejected not emitted"
+    );
+    let sub = client.get_explore_submission(&learner, &quest_id).unwrap();
+    assert_eq!(sub.status, crate::types::ExploreSubmissionStatus::Rejected);
 }
