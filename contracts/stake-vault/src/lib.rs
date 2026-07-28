@@ -28,13 +28,9 @@ pub const DEFAULT_LOCK_PERIOD_SECONDS: u64 = 604800;
 // Crate overview — stake lock holding and multiplier computation.
 // Provides `get_multiplier(user)` for cross-contract use by
 // QuestEngine on review-time payout calculation.
-use soroban_sdk::{contract, contractevent, contractimpl, token, Address, BytesN, Env};
+use soroban_sdk::{contractevent, Address, BytesN};
 
 pub mod types;
-use types::{DataKey, StakeInfo};
-
-#[contract]
-pub struct StakeVault;
 
 #[contractevent]
 pub struct StakeVaultInitialized {
@@ -67,209 +63,226 @@ pub struct ContractUpgraded {
     pub new_wasm_hash: BytesN<32>,
 }
 
-#[contractimpl]
-impl StakeVault {
-    /// Initializes the StakeVault with admin and reward token
-    /// addresses and emits `StakeVaultInitialized`. Admin-only at
-    /// deploy time. Re-initialization panics with
-    /// `"Already initialized"`.
-    pub fn initialize(env: Env, admin: Address, token: Address) {
-        if env.storage().instance().has(&DataKey::Admin) {
-            panic!("Already initialized");
+#[cfg(feature = "contract")]
+mod contract_impl {
+    use crate::types::{DataKey, StakeInfo};
+    use crate::{
+        ContractUpgraded, StakeVaultInitialized, Staked, Unstaked, DEFAULT_LOCK_PERIOD_SECONDS,
+        STAKE_TIER_HIGH_BPS, STAKE_TIER_LOW_BPS, STAKE_TIER_NONE_BPS, TIER_HIGH_STAKE_BOUND,
+        TIER_LOW_STAKE_BOUND, VERSION,
+    };
+    use soroban_sdk::{contract, contractimpl, token, Address, BytesN, Env};
+
+    #[contract]
+    pub struct StakeVault;
+
+    #[contractimpl]
+    impl StakeVault {
+        /// Initializes the StakeVault with admin and reward token
+        /// addresses and emits `StakeVaultInitialized`. Admin-only at
+        /// deploy time. Re-initialization panics with
+        /// `"Already initialized"`.
+        pub fn initialize(env: Env, admin: Address, token: Address) {
+            if env.storage().instance().has(&DataKey::Admin) {
+                panic!("Already initialized");
+            }
+
+            admin.require_auth();
+
+            env.storage().instance().set(&DataKey::Admin, &admin);
+            env.storage().instance().set(&DataKey::Token, &token);
+
+            StakeVaultInitialized { admin, token }.publish(&env);
         }
 
-        admin.require_auth();
+        /// Locks tokens for the configured lock period and resets the
+        /// caller's `lock_timestamp` to the current ledger time. Multi-call
+        /// stakes accumulate in the same `StakeInfo.amount` field.
+        pub fn stake(env: Env, user: Address, amount: i128) {
+            user.require_auth();
 
-        env.storage().instance().set(&DataKey::Admin, &admin);
-        env.storage().instance().set(&DataKey::Token, &token);
+            if amount <= 0 {
+                panic!("Amount must be positive");
+            }
 
-        StakeVaultInitialized { admin, token }.publish(&env);
-    }
+            let token_id: Address = env
+                .storage()
+                .instance()
+                .get(&DataKey::Token)
+                .expect("Not initialized");
+            let token_client = token::Client::new(&env, &token_id);
 
-    /// Locks tokens for the configured lock period and resets the
-    /// caller's `lock_timestamp` to the current ledger time. Multi-call
-    /// stakes accumulate in the same `StakeInfo.amount` field.
-    pub fn stake(env: Env, user: Address, amount: i128) {
-        user.require_auth();
+            token_client.transfer(&user, env.current_contract_address(), &amount);
 
-        if amount <= 0 {
-            panic!("Amount must be positive");
+            let now = env.ledger().timestamp();
+
+            let mut stake_info: StakeInfo = env
+                .storage()
+                .persistent()
+                .get(&DataKey::UserStake(user.clone()))
+                .unwrap_or(StakeInfo {
+                    amount: 0,
+                    lock_timestamp: now,
+                });
+
+            stake_info.amount += amount;
+            stake_info.lock_timestamp = now;
+
+            env.storage()
+                .persistent()
+                .set(&DataKey::UserStake(user.clone()), &stake_info);
+
+            Staked {
+                user,
+                amount,
+                total_staked: stake_info.amount,
+                lock_timestamp: stake_info.lock_timestamp,
+            }
+            .publish(&env);
         }
 
-        let token_id: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Token)
-            .expect("Not initialized");
-        let token_client = token::Client::new(&env, &token_id);
+        /// Releases the caller's full staked balance once the lock period
+        /// has elapsed. After successful withdrawal the storage slot is
+        /// cleared — subsequent `unstake` calls panic with `"No stake found"`.
+        pub fn unstake(env: Env, user: Address) {
+            user.require_auth();
 
-        token_client.transfer(&user, env.current_contract_address(), &amount);
+            let stake_info: StakeInfo = env
+                .storage()
+                .persistent()
+                .get(&DataKey::UserStake(user.clone()))
+                .expect("No stake found");
 
-        let now = env.ledger().timestamp();
+            let lock_period: u64 = DEFAULT_LOCK_PERIOD_SECONDS;
+            if env.ledger().timestamp() < stake_info.lock_timestamp + lock_period {
+                panic!("Lock period active");
+            }
 
-        let mut stake_info: StakeInfo = env
-            .storage()
-            .persistent()
-            .get(&DataKey::UserStake(user.clone()))
-            .unwrap_or(StakeInfo {
-                amount: 0,
-                lock_timestamp: now,
-            });
+            let token_id: Address = env
+                .storage()
+                .instance()
+                .get(&DataKey::Token)
+                .expect("Not initialized");
+            let token_client = token::Client::new(&env, &token_id);
 
-        stake_info.amount += amount;
-        stake_info.lock_timestamp = now;
+            token_client.transfer(
+                &env.current_contract_address(),
+                user.clone(),
+                &stake_info.amount,
+            );
 
-        env.storage()
-            .persistent()
-            .set(&DataKey::UserStake(user.clone()), &stake_info);
+            env.storage()
+                .persistent()
+                .remove(&DataKey::UserStake(user.clone()));
 
-        Staked {
-            user,
-            amount,
-            total_staked: stake_info.amount,
-            lock_timestamp: stake_info.lock_timestamp,
-        }
-        .publish(&env);
-    }
-
-    /// Releases the caller's full staked balance once the lock period
-    /// has elapsed. After successful withdrawal the storage slot is
-    /// cleared — subsequent `unstake` calls panic with `"No stake found"`.
-    pub fn unstake(env: Env, user: Address) {
-        user.require_auth();
-
-        let stake_info: StakeInfo = env
-            .storage()
-            .persistent()
-            .get(&DataKey::UserStake(user.clone()))
-            .expect("No stake found");
-
-        let lock_period: u64 = DEFAULT_LOCK_PERIOD_SECONDS;
-        if env.ledger().timestamp() < stake_info.lock_timestamp + lock_period {
-            panic!("Lock period active");
+            Unstaked {
+                user,
+                amount: stake_info.amount,
+            }
+            .publish(&env);
         }
 
-        let token_id: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Token)
-            .expect("Not initialized");
-        let token_client = token::Client::new(&env, &token_id);
+        /// Returns a basis-points multiplier based on the user's staked
+        /// amount. The scheme uses three tiers: 100 (default, 1.0x),
+        /// 120 (≥100 stake, 1.2x), and 200 (≥500 stake, 2.0x). Quest
+        /// review paths consult this value to scale payouts.
+        pub fn get_multiplier(env: Env, user: Address) -> u32 {
+            let stake_info: StakeInfo = env
+                .storage()
+                .persistent()
+                .get(&DataKey::UserStake(user))
+                .unwrap_or(StakeInfo {
+                    amount: 0,
+                    lock_timestamp: 0,
+                });
 
-        token_client.transfer(
-            &env.current_contract_address(),
-            user.clone(),
-            &stake_info.amount,
-        );
-
-        env.storage()
-            .persistent()
-            .remove(&DataKey::UserStake(user.clone()));
-
-        Unstaked {
-            user,
-            amount: stake_info.amount,
-        }
-        .publish(&env);
-    }
-
-    /// Returns a basis-points multiplier based on the user's staked
-    /// amount. The scheme uses three tiers: 100 (default, 1.0x),
-    /// 120 (≥100 stake, 1.2x), and 200 (≥500 stake, 2.0x). Quest
-    /// review paths consult this value to scale payouts.
-    pub fn get_multiplier(env: Env, user: Address) -> u32 {
-        let stake_info: StakeInfo = env
-            .storage()
-            .persistent()
-            .get(&DataKey::UserStake(user))
-            .unwrap_or(StakeInfo {
-                amount: 0,
-                lock_timestamp: 0,
-            });
-
-        if stake_info.amount >= 500 {
-            200
-        } else if stake_info.amount >= 100 {
-            120
-        } else {
-            100
-        }
-    }
-
-    /// Replaces the StakeVault WASM with the supplied hash on the
-    /// Soroban host. Admin-only. Emits `ContractUpgraded` on
-    /// successful deployment.
-    ///
-    /// After swapping the WASM, the caller **must** invoke `migrate()` in a
-    /// subsequent transaction so that any storage-schema changes are applied
-    /// before regular contract functions are used.
-    pub fn upgrade_contract(env: Env, admin: Address, new_wasm_hash: BytesN<32>) {
-        admin.require_auth();
-
-        let stored_admin: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .expect("Not initialized");
-        if admin != stored_admin {
-            panic!("Unauthorized");
+            if stake_info.amount >= TIER_HIGH_STAKE_BOUND {
+                STAKE_TIER_HIGH_BPS
+            } else if stake_info.amount >= TIER_LOW_STAKE_BOUND {
+                STAKE_TIER_LOW_BPS
+            } else {
+                STAKE_TIER_NONE_BPS
+            }
         }
 
-        env.deployer()
-            .update_current_contract_wasm(new_wasm_hash.clone());
+        /// Replaces the StakeVault WASM with the supplied hash on the
+        /// Soroban host. Admin-only. Emits `ContractUpgraded` on
+        /// successful deployment.
+        ///
+        /// After swapping the WASM, the caller **must** invoke `migrate()` in a
+        /// subsequent transaction so that any storage-schema changes are applied
+        /// before regular contract functions are used.
+        pub fn upgrade_contract(env: Env, admin: Address, new_wasm_hash: BytesN<32>) {
+            admin.require_auth();
 
-        ContractUpgraded {
-            admin,
-            new_wasm_hash,
-        }
-        .publish(&env);
-    }
+            let stored_admin: Address = env
+                .storage()
+                .instance()
+                .get(&DataKey::Admin)
+                .expect("Not initialized");
+            if admin != stored_admin {
+                panic!("Unauthorized");
+            }
 
-    /// Applies any pending storage-schema migrations for the current WASM version.
-    ///
-    /// Must be called by the admin in the first transaction after `upgrade_contract`.
-    ///
-    /// # Version transition table
-    /// | from | to | changes |
-    /// |------|-----|---------|
-    /// | 0    |  1  | Writes initial `Version = 1` marker; no struct changes |
-    ///
-    /// # Panics
-    /// * If the caller is not the Protocol Admin.
-    /// * If the on-chain version is already equal to or greater than `VERSION`.
-    pub fn migrate(env: Env, admin: Address) {
-        admin.require_auth();
+            env.deployer()
+                .update_current_contract_wasm(new_wasm_hash.clone());
 
-        let stored_admin: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .expect("Not initialized");
-        if admin != stored_admin {
-            panic!("Unauthorized");
+            ContractUpgraded {
+                admin,
+                new_wasm_hash,
+            }
+            .publish(&env);
         }
 
-        let current_version: u32 = env.storage().instance().get(&DataKey::Version).unwrap_or(0);
+        /// Applies any pending storage-schema migrations for the current WASM version.
+        ///
+        /// Must be called by the admin in the first transaction after `upgrade_contract`.
+        ///
+        /// # Version transition table
+        /// | from | to | changes |
+        /// |------|-----|---------|
+        /// | 0    |  1  | Writes initial `Version = 1` marker; no struct changes |
+        ///
+        /// # Panics
+        /// * If the caller is not the Protocol Admin.
+        /// * If the on-chain version is already equal to or greater than `VERSION`.
+        pub fn migrate(env: Env, admin: Address) {
+            admin.require_auth();
 
-        assert!(current_version < VERSION, "Already at current version");
+            let stored_admin: Address = env
+                .storage()
+                .instance()
+                .get(&DataKey::Admin)
+                .expect("Not initialized");
+            if admin != stored_admin {
+                panic!("Unauthorized");
+            }
 
-        // ── v0 → v1 ──────────────────────────────────────────────────────────
-        // StakeInfo struct is wire-compatible between v0 and v1.
-        // A future migration adding fields to StakeInfo would iterate
-        // StakerCount addresses and rewrite each UserStake(addr) here.
-        if current_version < 1 {
-            // No data transformation required.
+            let current_version: u32 = env.storage().instance().get(&DataKey::Version).unwrap_or(0);
+
+            assert!(current_version < VERSION, "Already at current version");
+
+            // ── v0 → v1 ──────────────────────────────────────────────────────────
+            // StakeInfo struct is wire-compatible between v0 and v1.
+            // A future migration adding fields to StakeInfo would iterate
+            // StakerCount addresses and rewrite each UserStake(addr) here.
+            if current_version < 1 {
+                // No data transformation required.
+            }
+
+            // ── write new version ─────────────────────────────────────────────────
+            env.storage().instance().set(&DataKey::Version, &VERSION);
         }
 
-        // ── write new version ─────────────────────────────────────────────────
-        env.storage().instance().set(&DataKey::Version, &VERSION);
-    }
-
-    /// Returns the schema version currently stored in instance storage.
-    /// Returns 0 when the contract was deployed before versioning was introduced.
-    pub fn contract_version(env: Env) -> u32 {
-        env.storage().instance().get(&DataKey::Version).unwrap_or(0)
+        /// Returns the schema version currently stored in instance storage.
+        /// Returns 0 when the contract was deployed before versioning was introduced.
+        pub fn contract_version(env: Env) -> u32 {
+            env.storage().instance().get(&DataKey::Version).unwrap_or(0)
+        }
     }
 }
+
+#[cfg(feature = "contract")]
+pub use contract_impl::{StakeVault, StakeVaultClient};
 
 mod test;

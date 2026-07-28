@@ -9,7 +9,6 @@
 ///   1 – initial versioned schema; Badge struct unchanged from v0
 pub const VERSION: u32 = 1;
 
-pub const BADGE_MINTED_AT_DEFAULT: u64 = 0;
 // Operational notes — badge revocation is irreversible from
 // this contract; off-chain records must snapshot
 // `badge.course_id` and `badge.minted_at`. Badge lookups are
@@ -73,7 +72,7 @@ mod contract_impl {
     use soroban_sdk::{contract, contractimpl, Address, BytesN, Env, Vec};
 
     use crate::types::{Badge, DataKey};
-    use crate::{BadgeMinted, BadgeRevoked, ContractUpgraded};
+    use crate::{BadgeMinted, BadgeRevoked, ContractUpgraded, MAX_BADGES_PER_LEARNER};
 
     #[contract]
     pub struct BadgeNFT;
@@ -125,6 +124,11 @@ mod contract_impl {
                 .persistent()
                 .get(&badges_key)
                 .unwrap_or_else(|| Vec::new(&env));
+
+            assert!(
+                badges.len() < MAX_BADGES_PER_LEARNER,
+                "Max badges per learner reached"
+            );
 
             for existing_badge in badges.iter() {
                 if existing_badge.course_id == course_id {

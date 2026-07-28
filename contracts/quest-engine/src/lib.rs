@@ -9,9 +9,6 @@
 ///   1 – initial versioned schema; Quest and Submission structs unchanged from v0
 pub const VERSION: u32 = 1;
 
-pub const BUILD_QUEST_PREFIX: &str = "build";
-
-pub const EXPLORE_QUEST_PREFIX: &str = "explore";
 // Operational notes — review paths cross-call
 // `StakeVault.get_multiplier` for payout scaling. Explore-quest
 // payouts route via `RewardPool.distribute_reward` (which
@@ -179,7 +176,7 @@ pub struct QuestEngineContract;
 pub fn compute_learner_payout(reward: i128, multiplier_bps: u32) -> (i128, i128, i128, bool) {
     let fee = (reward * PLATFORM_FEE_BASIS_POINTS as i128) / 10_000;
     let base = reward - fee;
-    let boost_actual = (base * multiplier_bps as i128) / 100;
+    let boost_actual = (base * multiplier_bps as i128) / stake_vault::STAKE_TIER_NONE_BPS as i128;
     let capped = boost_actual > base;
     let learner_amount = if capped { base } else { boost_actual };
     (fee, learner_amount, boost_actual, capped)
@@ -298,6 +295,11 @@ impl QuestEngineContract {
     ) -> u32 {
         // 1. employer.require_auth()
         employer.require_auth();
+
+        assert!(
+            reward_amount <= MAX_QUEST_REWARD,
+            "reward_amount exceeds max"
+        );
 
         // 2. Fetch token_client for the USDC asset.
         let token_address: Address = env

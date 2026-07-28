@@ -39,6 +39,8 @@ pub trait RewardPoolInterface {
     fn emergency_sweep(env: Env, admin: Address, recovery_wallet: Address);
     fn upgrade_contract(env: Env, admin: Address, new_wasm_hash: BytesN<32>);
     fn estimated_storage_footprint(env: Env) -> u32;
+    fn token_decimals(env: Env) -> u32;
+    fn platform_fee_basis_points(env: Env) -> u32;
     fn migrate(env: Env, admin: Address);
     fn contract_version(env: Env) -> u32;
 }
@@ -102,7 +104,8 @@ mod contract_impl {
     use crate::types::DataKey;
     use crate::{
         ContractUpgraded, EmergencySweep, PoolFunded, PoolInitialized, RewardDistributed,
-        SpenderAdded, SpenderRemoved,
+        SpenderAdded, SpenderRemoved, MAX_SPENDERS, MIN_PAYOUT_AMOUNT, PLATFORM_FEE_BASIS_POINTS,
+        REWARD_TOKEN_DECIMALS,
     };
 
     #[contract]
@@ -184,6 +187,7 @@ mod contract_impl {
                     .instance()
                     .get(&DataKey::SpenderCount)
                     .unwrap_or(0);
+                assert!(prev < MAX_SPENDERS, "Max spenders reached");
                 env.storage()
                     .instance()
                     .set(&DataKey::SpenderCount, &(prev + 1));
@@ -311,8 +315,8 @@ mod contract_impl {
             // 1. caller.require_auth()
             caller.require_auth();
 
-            // 2. Assert amount > 0
-            if amount <= 0 {
+            // 2. Assert amount meets the minimum payout requirement.
+            if amount < MIN_PAYOUT_AMOUNT {
                 panic!("Amount must be positive");
             }
 
@@ -449,6 +453,14 @@ mod contract_impl {
                 .instance()
                 .get(&DataKey::SpenderCount)
                 .unwrap_or(0)
+        }
+
+        pub fn token_decimals(_env: Env) -> u32 {
+            REWARD_TOKEN_DECIMALS
+        }
+
+        pub fn platform_fee_basis_points(_env: Env) -> u32 {
+            PLATFORM_FEE_BASIS_POINTS
         }
 
         /// Upgrades the contract WASM. Only callable by the Protocol Admin.
