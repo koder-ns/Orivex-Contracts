@@ -9,7 +9,7 @@ repository = "https://github.com/Kqirox/orivex-contracts"
 
 
 [lib]
-crate-type = ["lib"]
+crate-type = ["cdylib", "lib"]
 doctest = false
 
 [dependencies]
