@@ -27,10 +27,13 @@ pub const PLATFORM_FEE_BASIS_POINTS: u32 = 1500;
 
 pub mod types;
 pub use types::QuestType;
-use types::{DataKey, Quest, Submission, SubmissionStatus};
+use types::{
+    DataKey, ExploreSubmission, ExploreSubmissionStatus, Quest, Submission, SubmissionStatus,
+    MAX_REASON_LEN,
+};
 
 use soroban_sdk::{
-    contract, contractclient, contractevent, contractimpl, token, Address, BytesN, Env, Vec,
+    contract, contractclient, contractevent, contractimpl, token, Address, BytesN, Env, String, Vec,
 };
 
 #[contractclient(name = "StakeVaultClient")]
@@ -118,6 +121,35 @@ pub struct ExploreQuestVerified {
     #[topic]
     pub quest_id: u32,
     pub amount: i128,
+}
+
+/// Emitted when a learner submits an off-chain proof for an Explore quest.
+///
+/// This is the on-chain "intent" record — no tokens move at this point.
+/// The admin later calls `verify_explore_quest` (approve) or
+/// `reject_explore_quest` (deny) to finalise the outcome.
+#[contractevent]
+pub struct ExploreProofSubmitted {
+    #[topic]
+    pub learner: Address,
+    #[topic]
+    pub quest_id: u32,
+    pub proof_hash: BytesN<32>,
+}
+
+/// Emitted when an admin explicitly rejects a learner's Explore quest proof.
+///
+/// Provides a permanent, queryable audit trail for refused submissions.
+/// The `reason` field is capped at [`MAX_REASON_LEN`] bytes.
+#[contractevent]
+pub struct ExploreSubmissionRejected {
+    #[topic]
+    pub admin: Address,
+    #[topic]
+    pub learner: Address,
+    #[topic]
+    pub quest_id: u32,
+    pub reason: String,
 }
 
 #[contractevent]
@@ -791,11 +823,14 @@ impl QuestEngineContract {
     /// * If admin does not match stored admin
     /// * If quest is not found
     /// * If quest type is not Explore
+    /// * If no pending proof submission exists for this (learner, quest_id) pair
     /// * If contract is not initialized
-    /// Admin-only confirmation that a learner completed an off-chain
-    /// action. Triggers a cross-contract `distribute_reward` call into
-    /// the configured RewardPool. The QuestEngine must be whitelisted
-    /// as an approved spender on RewardPool.
+    ///
+    /// # Audit trail
+    /// Requires the learner to have first called `submit_explore_proof`. The
+    /// stored `ExploreSubmission` status is updated to `Verified` so the
+    /// decision is permanently recorded on-chain alongside the emitted
+    /// `ExploreQuestVerified` event.
     pub fn verify_explore_quest(env: Env, admin: Address, learner: Address, quest_id: u32) {
         // 1. admin.require_auth()
         admin.require_auth();
@@ -821,7 +856,19 @@ impl QuestEngineContract {
             "Not an Explore quest"
         );
 
-        // 5. Get reward pool address and create client
+        // 5. Require a pending explore submission for this (learner, quest_id)
+        let submission_key = DataKey::ExploreSubmission(learner.clone(), quest_id);
+        let mut submission: ExploreSubmission = env
+            .storage()
+            .persistent()
+            .get(&submission_key)
+            .expect("No proof submission found for this learner");
+        assert!(
+            submission.status == ExploreSubmissionStatus::Pending,
+            "Submission is not pending"
+        );
+
+        // 6. Get reward pool address and create client
         let reward_pool_address: Address = env
             .storage()
             .instance()
@@ -829,19 +876,176 @@ impl QuestEngineContract {
             .expect("Not initialized");
         let reward_pool_client = RewardPoolClient::new(&env, &reward_pool_address);
 
-        // 6. Distribute reward from RewardPool
+        // 7. Distribute reward from RewardPool
         reward_pool_client.distribute_reward(
             &env.current_contract_address(),
             &learner,
             &quest.reward_amount,
         );
 
-        // 7. Emit ExploreQuestVerified event
+        // 8. Mark submission as Verified
+        submission.status = ExploreSubmissionStatus::Verified;
+        env.storage().persistent().set(&submission_key, &submission);
+
+        // 9. Emit ExploreQuestVerified event
         ExploreQuestVerified {
             admin,
             learner,
             quest_id,
             amount: quest.reward_amount,
+        }
+        .publish(&env);
+    }
+
+    /// Records a learner's off-chain proof for an Explore quest on-chain.
+    ///
+    /// This is purely an intent/audit record — no tokens move. The admin
+    /// then calls `verify_explore_quest` to approve or `reject_explore_quest`
+    /// to deny the submission. Re-submission for the same (learner, quest_id)
+    /// pair is blocked once a record already exists.
+    ///
+    /// # Arguments
+    /// * `learner` - The learner submitting the proof (must authenticate)
+    /// * `quest_id` - The ID of the Explore quest
+    /// * `proof_hash` - 32-byte hash of the off-chain proof artifact
+    ///
+    /// # Panics
+    /// * If learner authentication fails
+    /// * If quest is not found or not active
+    /// * If quest type is not Explore
+    /// * If a submission already exists for this (learner, quest_id) pair
+    ///
+    /// # Events
+    /// Emits `ExploreProofSubmitted` on success.
+    pub fn submit_explore_proof(env: Env, learner: Address, quest_id: u32, proof_hash: BytesN<32>) {
+        // 1. learner.require_auth()
+        learner.require_auth();
+
+        // 2. Retrieve quest — must be active and Explore type
+        let quest: Quest = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Quest(quest_id))
+            .expect("Quest not found");
+        if !quest.active {
+            panic!("Quest is not active");
+        }
+        assert!(
+            quest.quest_type == QuestType::Explore,
+            "Only Explore quests accept explore proofs"
+        );
+
+        // 3. Guard against duplicate submissions
+        let submission_key = DataKey::ExploreSubmission(learner.clone(), quest_id);
+        if env.storage().persistent().has(&submission_key) {
+            panic!("Explore submission already exists");
+        }
+
+        // 4. Persist the submission record
+        let submission = ExploreSubmission {
+            proof_hash: proof_hash.clone(),
+            status: ExploreSubmissionStatus::Pending,
+        };
+        env.storage().persistent().set(&submission_key, &submission);
+
+        // 5. Emit ExploreProofSubmitted event
+        ExploreProofSubmitted {
+            learner,
+            quest_id,
+            proof_hash,
+        }
+        .publish(&env);
+    }
+
+    /// Returns a learner's Explore quest submission record, if any.
+    pub fn get_explore_submission(
+        env: Env,
+        learner: Address,
+        quest_id: u32,
+    ) -> Option<ExploreSubmission> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::ExploreSubmission(learner, quest_id))
+    }
+
+    /// Rejects a learner's Explore quest proof, recording the reason on-chain.
+    ///
+    /// The submission must be in `Pending` state. After rejection the status
+    /// is updated to `Rejected` so the decision is permanently auditable via
+    /// both storage reads and the emitted `ExploreSubmissionRejected` event.
+    ///
+    /// # Arguments
+    /// * `admin` - The admin address (must match stored admin)
+    /// * `learner` - The learner whose submission is being rejected
+    /// * `quest_id` - The ID of the Explore quest
+    /// * `reason` - Human-readable rejection reason (max [`MAX_REASON_LEN`] bytes)
+    ///
+    /// # Panics
+    /// * If admin authentication fails
+    /// * If admin does not match stored admin
+    /// * If quest is not found or not of Explore type
+    /// * If no pending submission exists for this (learner, quest_id) pair
+    /// * If `reason` exceeds `MAX_REASON_LEN` bytes
+    ///
+    /// # Events
+    /// Emits `ExploreSubmissionRejected` on success.
+    pub fn reject_explore_quest(
+        env: Env,
+        admin: Address,
+        learner: Address,
+        quest_id: u32,
+        reason: String,
+    ) {
+        // 1. admin.require_auth()
+        admin.require_auth();
+
+        // 2. Verify admin
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Not initialized");
+        assert!(admin == stored_admin, "Unauthorized");
+
+        // 3. Guard reason length to keep Soroban string costs bounded
+        assert!(
+            reason.len() <= MAX_REASON_LEN,
+            "Reason exceeds maximum length"
+        );
+
+        // 4. Get quest — must be Explore type
+        let quest: Quest = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Quest(quest_id))
+            .expect("Quest not found");
+        assert!(
+            quest.quest_type == QuestType::Explore,
+            "Not an Explore quest"
+        );
+
+        // 5. Retrieve the pending explore submission
+        let submission_key = DataKey::ExploreSubmission(learner.clone(), quest_id);
+        let mut submission: ExploreSubmission = env
+            .storage()
+            .persistent()
+            .get(&submission_key)
+            .expect("No proof submission found for this learner");
+        assert!(
+            submission.status == ExploreSubmissionStatus::Pending,
+            "Submission is not pending"
+        );
+
+        // 6. Update status to Rejected
+        submission.status = ExploreSubmissionStatus::Rejected;
+        env.storage().persistent().set(&submission_key, &submission);
+
+        // 7. Emit ExploreSubmissionRejected event
+        ExploreSubmissionRejected {
+            admin,
+            learner,
+            quest_id,
+            reason,
         }
         .publish(&env);
     }

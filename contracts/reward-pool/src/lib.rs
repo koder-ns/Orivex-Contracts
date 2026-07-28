@@ -32,6 +32,7 @@ pub mod types;
 pub trait RewardPoolInterface {
     fn initialize(env: Env, admin: Address, token: Address);
     fn add_approved_spender(env: Env, admin: Address, spender: Address);
+    fn remove_approved_spender(env: Env, admin: Address, spender: Address);
     fn set_pause(env: Env, admin: Address, status: bool);
     fn distribute_reward(env: Env, caller: Address, learner: Address, amount: i128);
     fn fund_pool(env: Env, donor: Address, amount: i128);
@@ -52,6 +53,12 @@ pub struct PoolInitialized {
 
 #[contractevent]
 pub struct SpenderAdded {
+    #[topic]
+    pub spender: Address,
+}
+
+#[contractevent]
+pub struct SpenderRemoved {
     #[topic]
     pub spender: Address,
 }
@@ -95,7 +102,7 @@ mod contract_impl {
     use crate::types::DataKey;
     use crate::{
         ContractUpgraded, EmergencySweep, PoolFunded, PoolInitialized, RewardDistributed,
-        SpenderAdded,
+        SpenderAdded, SpenderRemoved,
     };
 
     #[contract]
@@ -184,6 +191,63 @@ mod contract_impl {
 
             // 5. Emit SpenderAdded event
             SpenderAdded { spender }.publish(&env);
+        }
+
+        /// Removes a contract address from the approved spender whitelist.
+        ///
+        /// # Arguments
+        /// * `admin` - The admin address (must match stored admin)
+        /// * `spender` - The contract address to remove from the whitelist
+        ///
+        /// # Panics
+        /// * If contract is not initialized
+        /// * If admin does not match stored admin
+        /// * If admin authentication fails
+        /// * If the spender is not currently whitelisted
+        ///
+        /// Removes an approved spender so they can no longer call
+        /// `distribute_reward`. Panics with `"Spender not found"` when
+        /// attempting to remove an address that was never whitelisted,
+        /// preventing silent no-ops. Decrements `SpenderCount`.
+        pub fn remove_approved_spender(env: Env, admin: Address, spender: Address) {
+            // 1. Fetch stored admin
+            let stored_admin: Address = env
+                .storage()
+                .instance()
+                .get(&DataKey::Admin)
+                .expect("Not initialized");
+
+            // 2. Assert admin == stored_admin
+            if admin != stored_admin {
+                panic!("Unauthorized");
+            }
+
+            // 3. admin.require_auth()
+            admin.require_auth();
+
+            // 4. Assert spender exists before removing
+            let spender_key = DataKey::Spender(spender.clone());
+            if !env.storage().persistent().has(&spender_key) {
+                panic!("Spender not found");
+            }
+
+            // 5. Remove from persistent storage
+            env.storage().persistent().remove(&spender_key);
+
+            // 6. Decrement the footprint counter
+            let prev: u32 = env
+                .storage()
+                .instance()
+                .get(&DataKey::SpenderCount)
+                .unwrap_or(0);
+            if prev > 0 {
+                env.storage()
+                    .instance()
+                    .set(&DataKey::SpenderCount, &(prev - 1));
+            }
+
+            // 7. Emit SpenderRemoved event
+            SpenderRemoved { spender }.publish(&env);
         }
 
         /// Toggles the pause state of the contract (emergency circuit breaker).
