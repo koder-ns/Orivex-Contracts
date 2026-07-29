@@ -32,12 +32,15 @@ pub mod types;
 pub trait RewardPoolInterface {
     fn initialize(env: Env, admin: Address, token: Address);
     fn add_approved_spender(env: Env, admin: Address, spender: Address);
+    fn remove_approved_spender(env: Env, admin: Address, spender: Address);
     fn set_pause(env: Env, admin: Address, status: bool);
     fn distribute_reward(env: Env, caller: Address, learner: Address, amount: i128);
     fn fund_pool(env: Env, donor: Address, amount: i128);
     fn emergency_sweep(env: Env, admin: Address, recovery_wallet: Address);
     fn upgrade_contract(env: Env, admin: Address, new_wasm_hash: BytesN<32>);
     fn estimated_storage_footprint(env: Env) -> u32;
+    fn token_decimals(env: Env) -> u32;
+    fn platform_fee_basis_points(env: Env) -> u32;
     fn migrate(env: Env, admin: Address);
     fn contract_version(env: Env) -> u32;
 }
@@ -52,6 +55,12 @@ pub struct PoolInitialized {
 
 #[contractevent]
 pub struct SpenderAdded {
+    #[topic]
+    pub spender: Address,
+}
+
+#[contractevent]
+pub struct SpenderRemoved {
     #[topic]
     pub spender: Address,
 }
@@ -95,7 +104,8 @@ mod contract_impl {
     use crate::types::DataKey;
     use crate::{
         ContractUpgraded, EmergencySweep, PoolFunded, PoolInitialized, RewardDistributed,
-        SpenderAdded,
+        SpenderAdded, SpenderRemoved, MAX_SPENDERS, MIN_PAYOUT_AMOUNT, PLATFORM_FEE_BASIS_POINTS,
+        REWARD_TOKEN_DECIMALS,
     };
 
     #[contract]
@@ -177,6 +187,7 @@ mod contract_impl {
                     .instance()
                     .get(&DataKey::SpenderCount)
                     .unwrap_or(0);
+                assert!(prev < MAX_SPENDERS, "Max spenders reached");
                 env.storage()
                     .instance()
                     .set(&DataKey::SpenderCount, &(prev + 1));
@@ -184,6 +195,63 @@ mod contract_impl {
 
             // 5. Emit SpenderAdded event
             SpenderAdded { spender }.publish(&env);
+        }
+
+        /// Removes a contract address from the approved spender whitelist.
+        ///
+        /// # Arguments
+        /// * `admin` - The admin address (must match stored admin)
+        /// * `spender` - The contract address to remove from the whitelist
+        ///
+        /// # Panics
+        /// * If contract is not initialized
+        /// * If admin does not match stored admin
+        /// * If admin authentication fails
+        /// * If the spender is not currently whitelisted
+        ///
+        /// Removes an approved spender so they can no longer call
+        /// `distribute_reward`. Panics with `"Spender not found"` when
+        /// attempting to remove an address that was never whitelisted,
+        /// preventing silent no-ops. Decrements `SpenderCount`.
+        pub fn remove_approved_spender(env: Env, admin: Address, spender: Address) {
+            // 1. Fetch stored admin
+            let stored_admin: Address = env
+                .storage()
+                .instance()
+                .get(&DataKey::Admin)
+                .expect("Not initialized");
+
+            // 2. Assert admin == stored_admin
+            if admin != stored_admin {
+                panic!("Unauthorized");
+            }
+
+            // 3. admin.require_auth()
+            admin.require_auth();
+
+            // 4. Assert spender exists before removing
+            let spender_key = DataKey::Spender(spender.clone());
+            if !env.storage().persistent().has(&spender_key) {
+                panic!("Spender not found");
+            }
+
+            // 5. Remove from persistent storage
+            env.storage().persistent().remove(&spender_key);
+
+            // 6. Decrement the footprint counter
+            let prev: u32 = env
+                .storage()
+                .instance()
+                .get(&DataKey::SpenderCount)
+                .unwrap_or(0);
+            if prev > 0 {
+                env.storage()
+                    .instance()
+                    .set(&DataKey::SpenderCount, &(prev - 1));
+            }
+
+            // 7. Emit SpenderRemoved event
+            SpenderRemoved { spender }.publish(&env);
         }
 
         /// Toggles the pause state of the contract (emergency circuit breaker).
@@ -247,8 +315,8 @@ mod contract_impl {
             // 1. caller.require_auth()
             caller.require_auth();
 
-            // 2. Assert amount > 0
-            if amount <= 0 {
+            // 2. Assert amount meets the minimum payout requirement.
+            if amount < MIN_PAYOUT_AMOUNT {
                 panic!("Amount must be positive");
             }
 
@@ -385,6 +453,14 @@ mod contract_impl {
                 .instance()
                 .get(&DataKey::SpenderCount)
                 .unwrap_or(0)
+        }
+
+        pub fn token_decimals(_env: Env) -> u32 {
+            REWARD_TOKEN_DECIMALS
+        }
+
+        pub fn platform_fee_basis_points(_env: Env) -> u32 {
+            PLATFORM_FEE_BASIS_POINTS
         }
 
         /// Upgrades the contract WASM. Only callable by the Protocol Admin.

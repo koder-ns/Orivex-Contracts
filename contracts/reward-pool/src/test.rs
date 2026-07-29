@@ -163,6 +163,35 @@ fn test_add_same_spender_twice() {
     client.add_approved_spender(&admin, &spender);
 }
 
+#[test]
+#[should_panic(expected = "Max spenders reached")]
+fn test_add_approved_spender_respects_max_limit() {
+    let (env, client) = setup();
+    let admin = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    client.initialize(&admin, &token);
+
+    for _ in 0..crate::MAX_SPENDERS {
+        let spender = Address::generate(&env);
+        client.add_approved_spender(&admin, &spender);
+    }
+
+    let overflow_spender = Address::generate(&env);
+    client.add_approved_spender(&admin, &overflow_spender);
+}
+
+#[test]
+fn test_token_decimals_is_exposed() {
+    let (env, client) = setup();
+    let admin = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    client.initialize(&admin, &token);
+
+    assert_eq!(client.token_decimals(), crate::REWARD_TOKEN_DECIMALS);
+}
+
 // ── distribute_reward Tests ───────────────────────────────────────────────────
 
 #[test]

@@ -9,9 +9,6 @@
 ///   1 – initial versioned schema; Quest and Submission structs unchanged from v0
 pub const VERSION: u32 = 1;
 
-pub const BUILD_QUEST_PREFIX: &str = "build";
-
-pub const EXPLORE_QUEST_PREFIX: &str = "explore";
 // Operational notes — review paths cross-call
 // `StakeVault.get_multiplier` for payout scaling. Explore-quest
 // payouts route via `RewardPool.distribute_reward` (which
@@ -31,7 +28,7 @@ pub use types::QuestType;
 use types::{DataKey, Dispute, Quest, Submission, SubmissionStatus};
 
 use soroban_sdk::{
-    contract, contractclient, contractevent, contractimpl, token, Address, BytesN, Env, Vec,
+    contract, contractclient, contractevent, contractimpl, token, Address, BytesN, Env, String, Vec,
 };
 
 #[contractclient(name = "StakeVaultClient")]
@@ -126,6 +123,35 @@ pub struct ExploreQuestVerified {
     pub amount: i128,
 }
 
+/// Emitted when a learner submits an off-chain proof for an Explore quest.
+///
+/// This is the on-chain "intent" record — no tokens move at this point.
+/// The admin later calls `verify_explore_quest` (approve) or
+/// `reject_explore_quest` (deny) to finalise the outcome.
+#[contractevent]
+pub struct ExploreProofSubmitted {
+    #[topic]
+    pub learner: Address,
+    #[topic]
+    pub quest_id: u32,
+    pub proof_hash: BytesN<32>,
+}
+
+/// Emitted when an admin explicitly rejects a learner's Explore quest proof.
+///
+/// Provides a permanent, queryable audit trail for refused submissions.
+/// The `reason` field is capped at [`MAX_REASON_LEN`] bytes.
+#[contractevent]
+pub struct ExploreSubmissionRejected {
+    #[topic]
+    pub admin: Address,
+    #[topic]
+    pub learner: Address,
+    #[topic]
+    pub quest_id: u32,
+    pub reason: String,
+}
+
 #[contractevent]
 pub struct RewardPoolUpdated {
     #[topic]
@@ -184,7 +210,7 @@ pub struct QuestEngineContract;
 pub fn compute_learner_payout(reward: i128, multiplier_bps: u32) -> (i128, i128, i128, bool) {
     let fee = (reward * PLATFORM_FEE_BASIS_POINTS as i128) / 10_000;
     let base = reward - fee;
-    let boost_actual = (base * multiplier_bps as i128) / 100;
+    let boost_actual = (base * multiplier_bps as i128) / stake_vault::STAKE_TIER_NONE_BPS as i128;
     let capped = boost_actual > base;
     let learner_amount = if capped { base } else { boost_actual };
     (fee, learner_amount, boost_actual, capped)
@@ -330,6 +356,11 @@ impl QuestEngineContract {
     ) -> u32 {
         // 1. employer.require_auth()
         employer.require_auth();
+
+        assert!(
+            reward_amount <= MAX_QUEST_REWARD,
+            "reward_amount exceeds max"
+        );
 
         // 2. Fetch token_client for the USDC asset.
         let token_address: Address = env
@@ -857,11 +888,14 @@ impl QuestEngineContract {
     /// * If admin does not match stored admin
     /// * If quest is not found
     /// * If quest type is not Explore
+    /// * If no pending proof submission exists for this (learner, quest_id) pair
     /// * If contract is not initialized
-    /// Admin-only confirmation that a learner completed an off-chain
-    /// action. Triggers a cross-contract `distribute_reward` call into
-    /// the configured RewardPool. The QuestEngine must be whitelisted
-    /// as an approved spender on RewardPool.
+    ///
+    /// # Audit trail
+    /// Requires the learner to have first called `submit_explore_proof`. The
+    /// stored `ExploreSubmission` status is updated to `Verified` so the
+    /// decision is permanently recorded on-chain alongside the emitted
+    /// `ExploreQuestVerified` event.
     pub fn verify_explore_quest(env: Env, admin: Address, learner: Address, quest_id: u32) {
         // 1. admin.require_auth()
         admin.require_auth();
@@ -887,7 +921,19 @@ impl QuestEngineContract {
             "Not an Explore quest"
         );
 
-        // 5. Get reward pool address and create client
+        // 5. Require a pending explore submission for this (learner, quest_id)
+        let submission_key = DataKey::ExploreSubmission(learner.clone(), quest_id);
+        let mut submission: ExploreSubmission = env
+            .storage()
+            .persistent()
+            .get(&submission_key)
+            .expect("No proof submission found for this learner");
+        assert!(
+            submission.status == ExploreSubmissionStatus::Pending,
+            "Submission is not pending"
+        );
+
+        // 6. Get reward pool address and create client
         let reward_pool_address: Address = env
             .storage()
             .instance()
@@ -895,14 +941,18 @@ impl QuestEngineContract {
             .expect("Not initialized");
         let reward_pool_client = RewardPoolClient::new(&env, &reward_pool_address);
 
-        // 6. Distribute reward from RewardPool
+        // 7. Distribute reward from RewardPool
         reward_pool_client.distribute_reward(
             &env.current_contract_address(),
             &learner,
             &quest.reward_amount,
         );
 
-        // 7. Emit ExploreQuestVerified event
+        // 8. Mark submission as Verified
+        submission.status = ExploreSubmissionStatus::Verified;
+        env.storage().persistent().set(&submission_key, &submission);
+
+        // 9. Emit ExploreQuestVerified event
         ExploreQuestVerified {
             admin,
             learner,
